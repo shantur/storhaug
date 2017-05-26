@@ -5,7 +5,7 @@ HA_NFS_TYPE="glusterfs"
 HA_NFS_VOL="gluster_shared_storage"
 
 # [OPTIONAL] Mount point for shared volume.
-HA_NFS_MNT_DIR="state"
+HA_NFS_MNT_DIR="shared_storage"
 
 # [OPTIONAL] Config file for NFS. If not specified, we'll will try to find it.
 HA_NFS_CONF="/etc/ganesha/ganesha.conf"

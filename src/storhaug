@@ -17,12 +17,14 @@ HA_CONF="${SYS_CONFDIR}/storhaug.conf"
 HA_CONF_INCDIR="${SYS_CONFDIR}/storhaug.d"
 HA_MNT_DIR="/run/storhaug"
 HA_SMB_MNT_DIR="lock"
-HA_NFS_MNT_DIR="state"
 STORAGE_SERVERS=""
 STORAGE_NUM_SERVERS=0
 DETERMINISTIC_FAILOVER=false
 SERVICE_MAN="DISTRO_NOT_FOUND"
 SECRET_PEM="${HA_CONF_INCDIR}/secret.pem"
+HA_SVC_NFS="no"
+HA_SVC_SMB="no"
+PORTBLOCK_UNBLOCK_TIMEOUT="60s"
 
 ### Utility functions
 
@@ -54,10 +56,22 @@ usage()
 parsebool()
 {
     case $(eval echo \${${1}}) in
-        TRUE | True | true | YES | Yes | yes) declare "${1}"=true ;;
-        FALSE | False | false | NO | No | no) declare "${1}"=false ;;
+        [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss]) declare "${1}"=true ;;
+        [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo]) declare "${1}"=false ;;
         *) storlog "ERR" "Couldn't parse boolean: ${1}=$(eval echo \${${1}})" ;;
     esac
+}
+
+parse_services()
+{
+    IFS=$' '
+    for svc in ${HA_SERVICES} ; do
+        case ${svc} in
+        [Nn][Ff][Ss]) HA_SVC_NFS="yes" ;;
+        [Ss][Mm][Bb]) HA_SVC_SMB="yes" ;;
+        *) storlog "ERR" "Couldn't parse services: ${svc}" ;;
+        esac
+    done
 }
 
 storlog()
@@ -67,7 +81,7 @@ storlog()
         ERR|ERROR)
         echo "ERROR: $1" >&2
         logger --tag="storhaug" -p "daemon.err" "$1"
-        rm -rf $HA_CONF_secdir
+        rm -rf ${HA_CONF_secdir}
         exit 1
         ;;
         WARN|WARNING)
@@ -155,7 +169,7 @@ check_cluster_exists()
 {
     local name=${1}
 
-    if [ -e /var/run/corosync.pid ]; then
+    if [ -e /run/corosync.pid ]; then
         local cluster_name=$(pcs status | grep "Cluster name:" | cut -d ' ' -f 3)
         if [ ${cluster_name} -a ${cluster_name} = ${name} ]; then
             storlog "ERR" "Cluster $name already exists, exiting"
@@ -291,28 +305,43 @@ create_virt_ip()
     local ipcount=${1}; shift
     local ip=${1}; shift
 
-    pcs -f ${cibfile} resource create vip${ipcount} ocf:heartbeat:IPaddr2 \
-        params \
-            ip=${ip} \
-            flush_routes="true" \
-        op monitor interval=60s \
-        meta resource-stickiness="0"
+    if [[ "X${HA_SVC_NFS}X" == "XyesX" ]]; then
+        pcs -f ${cibfile} resource create vip${ipcount} ocf:heartbeat:IPaddr2 \
+            --group group${ipcount} \
+            params \
+                ip=${ip} \
+                flush_routes="true" \
+            op monitor interval=60s \
+            meta resource-stickiness="0"
+
+        pcs -f ${cibfile} resource create vip${ipcount}_block ocf:heartbeat:portblock \
+            protocol=tcp portno=2049 action=block ip=${ip} --group group${ipcount}
+
+        pcs -f ${cibfile} resource create vip${ipcount}_unblock ocf:heartbeat:portblock \
+            protocol=tcp portno=2049 action=unblock ip=${ip} --group group${ipcount} \
+            --after vip${ipcount} reset_local_on_unblock_stop=true \
+            tickle_dir=${HA_VOL_MNT}/nfs-ganesha/tickle_dir/ \
+            op stop timeout=${PORTBLOCK_UNBLOCK_TIMEOUT} \
+            op start timeout=${PORTBLOCK_UNBLOCK_TIMEOUT} \
+            op monitor interval=10s timeout=${PORTBLOCK_UNBLOCK_TIMEOUT}
+    else
+        pcs -f ${cibfile} resource create vip${ipcount} ocf:heartbeat:IPaddr2 \
+            params \
+                ip=${ip} \
+                flush_routes="true" \
+            op monitor interval=60s \
+            meta resource-stickiness="0"
+    fi
 
     pcs -f ${cibfile} constraint location vip${ipcount} rule resource-discovery=exclusive score=0 role eq storage
 
     pcs -f ${cibfile} resource create vip${ipcount}_trigger ocf:heartbeat:ganesha_trigger \
-        --clone vip${ipcount}_trigger-clone vip${ipcount}_trigger \
-	meta interleave="true" globally-unique="false" notify="true" clone-max=1
+        meta resource-stickiness="0"
 
-    pcs -f ${cibfile} constraint colocation add vip${ipcount}_trigger-clone with vip${ipcount} INFINITY
-    pcs -f ${cibfile} constraint order vip${ipcount} then vip${ipcount}_trigger-clone
-
-    pcs -f ${cibfile} constraint colocation add vip${ipcount} with nfs-ganesha-clone INFINITY
-    pcs -f ${cibfile} constraint order nfs-ganesha-clone then vip${ipcount}
-
-    pcs -f ${cibfile} constraint colocation add vip${ipcount} with ctdb-master INFINITY
-    pcs -f ${cibfile} constraint order ctdb-master then vip${ipcount}
+    pcs -f ${cibfile} constraint colocation add vip${ipcount}_trigger with vip${ipcount} INFINITY
+    pcs -f ${cibfile} constraint order vip${ipcount} then vip${ipcount}_trigger
 }
+
 
 ### Setup functions
 
@@ -364,67 +393,71 @@ setup_cluster()
 
 setup_create_resources()
 {
-    local cibfile=$(mktemp --tmpdir=$HA_CONF_secdir)
+    local cibfile=$(mktemp --tmpdir=${HA_CONF_secdir})
 
     pcs cluster cib ${cibfile}
 
-    # Shared volumes
-    mkdir -p "${HA_MNT_DIR}/${HA_NFS_MNT_DIR}"
-    pcs -f ${cibfile} resource create ganesha_state ocf:heartbeat:Filesystem \
-        params \
-            device="localhost:/${HA_NFS_VOL}" \
-            directory="${HA_MNT_DIR}/${HA_NFS_MNT_DIR}" \
-            fstype="glusterfs" \
-            options="_netdev,defaults,direct-io-mode=enable,transport=tcp,xlator-option=*client*.ping-timeout=10" \
-        --clone ganesha_state-clone ganesha_state meta interleave="true" clone-max="${STORAGE_NUM_SERVERS}"
+    if [ "X${HA_SVC_NFS}X" = "XyesX" ]; then
+        # Shared volumes
+        mkdir -p "${HA_MNT_DIR}/${HA_NFS_MNT_DIR}"
+        pcs -f ${cibfile} resource create ganesha_state ocf:heartbeat:Filesystem \
+            params \
+                device="localhost:/${HA_NFS_VOL}" \
+                directory="${HA_MNT_DIR}/${HA_NFS_MNT_DIR}" \
+                fstype="glusterfs" \
+                options="_netdev,defaults,direct-io-mode=enable,transport=tcp,xlator-option=*client*.ping-timeout=10" \
+            --clone ganesha_state-clone ganesha_state meta interleave="true" clone-max="${STORAGE_NUM_SERVERS}"
 
-    pcs -f ${cibfile} constraint location ganesha_state-clone rule resource-discovery=exclusive score=0 role eq storage
+        pcs -f ${cibfile} constraint location ganesha_state-clone rule resource-discovery=exclusive score=0 role eq storage
 
-    pcs cluster cib-push ${cibfile} || storlog "ERR" "Failed to create filesystem resources."
+        pcs cluster cib-push ${cibfile} || storlog "ERR" "Failed to create filesystem resources."
 
-    # CTDB
-    pcs -f ${cibfile} resource create ctdb ocf:heartbeat:CTDB \
-        params \
-            ctdb_socket="/var/run/ctdb/ctdbd.socket" \
-            ctdb_manages_winbind="no" \
-            ctdb_manages_samba="no" \
-            ctdb_logfile="/var/log/log.ctdb" \
-        op monitor interval="10" timeout="30" \
-        op monitor interval="11" timeout="30" role="Master" \
-        op start interval="0" timeout="90" \
-        op stop interval="0" timeout="100" \
-        op promote interval="0" timeout="30" \
-        op demote interval="0" timeout="30" \
-        --master meta interleave="true" globally-unique="false" notify="true" clone-max="${STORAGE_NUM_SERVERS}"
-
-    # Samba
-    pcs -f ${cibfile} resource create nmb systemd:nmb \
-        op start timeout="60" interval="0" \
-        op stop timeout="60" interval="0" \
-        op monitor interval="60" timeout="60"
-    pcs -f ${cibfile} resource create smb systemd:smb \
-        op start timeout="60" interval="0" \
-        op stop timeout="60" interval="0" \
-        op monitor interval="60" timeout="60"
-    pcs -f ${cibfile} resource group add samba-group nmb smb
-    pcs -f ${cibfile} resource clone samba-group meta interleave="true" clone-max="${STORAGE_NUM_SERVERS}"
-
-    # Samba: We need CTDB
-    pcs -f ${cibfile} constraint colocation add samba-group-clone with ctdb-master INFINITY
-    pcs -f ${cibfile} constraint order ctdb-master then samba-group-clone INFINITY
-
-    # Ganesha
-    pcs -f ${cibfile} resource create nfs-ganesha ocf:heartbeat:ganesha \
-        params \
-            config="${HA_NFS_CONF}" \
+        pcs -f ${cibfile} resource create nfs-ganesha ocf:heartbeat:ganesha \
+            params \
+                config="${HA_NFS_CONF}" \
             state_fs="${HA_NFS_TYPE}" \
-            state_mnt="${HA_MNT_DIR}/${HA_NFS_MNT_DIR}" \
-        --clone nfs-ganesha-clone ganesha meta interleave="true" \
-                                           globally-unique="false"
+                state_mnt="${HA_MNT_DIR}/${HA_NFS_MNT_DIR}" \
+            --clone nfs-ganesha-clone ganesha meta interleave="true" \
+                                               globally-unique="false" \
+                                               notify="true"
 
-    # Ganesha: We need our shared state FS
-    pcs -f ${cibfile} constraint colocation add nfs-ganesha-clone with ganesha_state-clone INFINITY
-    pcs -f ${cibfile} constraint order ganesha_state-clone then nfs-ganesha-clone INFINITY
+        pcs -f ${cibfile} constraint colocation add nfs-ganesha-clone with ganesha_state-clone INFINITY
+        pcs -f ${cibfile} constraint order ganesha_state-clone then nfs-ganesha-clone INFINITY
+    fi
+
+    if [ "X${HA_SVC_SMB}X" = "XyesX" ]; then
+        # CTDB
+        pcs -f ${cibfile} resource create ctdb ocf:heartbeat:CTDB \
+            params \
+                ctdb_socket="/run/ctdb/ctdbd.socket" \
+                ctdb_manages_winbind="no" \
+                ctdb_manages_samba="no" \
+                ctdb_logfile="/var/log/log.ctdb" \
+            op monitor interval="10" timeout="30" \
+            op monitor interval="11" timeout="30" role="Master" \
+            op start interval="0" timeout="90" \
+            op stop interval="0" timeout="100" \
+            op promote interval="0" timeout="30" \
+            op demote interval="0" timeout="30" \
+            --master meta interleave="true" globally-unique="false" notify="true" clone-max="${STORAGE_NUM_SERVERS}"
+
+        # Samba
+        pcs -f ${cibfile} resource create nmb systemd:nmb \
+            op start timeout="60" interval="0" \
+            op stop timeout="60" interval="0" \
+            op monitor interval="60" timeout="60"
+        pcs -f ${cibfile} resource create smb systemd:smb \
+            op start timeout="60" interval="0" \
+            op stop timeout="60" interval="0" \
+            op monitor interval="60" timeout="60"
+        pcs -f ${cibfile} resource group add samba-group nmb smb
+        pcs -f ${cibfile} resource clone samba-group meta interleave="true" clone-max="${STORAGE_NUM_SERVERS}"
+
+        # Samba: We need CTDB
+        pcs -f ${cibfile} constraint colocation add samba-group-clone with ctdb-master INFINITY
+        pcs -f ${cibfile} constraint order ctdb-master then samba-group-clone INFINITY
+    fi
+
 
     pcs cluster cib-push ${cibfile} || storlog "ERR" "Failed to create service resources."
 
@@ -449,7 +482,7 @@ setup_create_resources()
 # TODO: Move to RA
 setup_state_volume()
 {
-    local mnt=$(mktemp -d --tmpdir=$HA_CONF_secdir)
+    local mnt=$(mktemp -d --tmpdir=${HA_CONF_secdir})
     local dname=""
     local dirname=""
     local staterefs="${mnt}/nfs-ganesha/.noderefs"
@@ -497,14 +530,6 @@ setup_state_volume()
 
 teardown_cluster()
 {
-    for server in ${HA_SERVERS} ; do
-        if [[ ${HA_CLUSTER_NODES} != *${server}* ]]; then
-            storlog "INFO" "${server} is not in config, removing"
-            pcs cluster stop ${server} || storlog "WARN" "Failed: pcs cluster stop ${server}"
-            pcs cluster node remove ${server} || storlog "WARN" "Failed: pcs cluster node remove ${server}"
-        fi
-    done
-
 # BZ 1193433 - pcs doesn't reload cluster.conf after modification
 # after teardown completes, a subsequent setup will appear to have
 # 'remembered' the deleted node. You can work around this by
@@ -541,9 +566,9 @@ addnode()
 
     storlog "INFO" "Adding node ${node} to ${HA_NAME}"
 
-    HA_CLUSTER_NODES="$HA_CLUSTER_NODES,$node"
+    HA_CLUSTER_NODES="${HA_CLUSTER_NODES},$node"
     if [ "${role}" == *storage* ]; then
-        STORAGE_NODES="$STORAGE_NODES,$node"
+        STORAGE_NODES="${STORAGE_NODES},$node"
     fi
     if [ "x${vip}" != "x" ]; then
         HA_VIPS="${HA_VIPS} ${vip}"
@@ -562,7 +587,7 @@ addnode()
     fi
 
     if [ "x${vip}" != "x" ]; then
-        local cibfile=$(mktemp --tmpdir=$HA_CONF_secdir)
+        local cibfile=$(mktemp --tmpdir=${HA_CONF_secdir})
         pcs cluster cib ${cibfile}
 
         local ipcount=$(wc -w <<< "${HA_VIPS}")
@@ -614,7 +639,7 @@ deletenode()
     pcs cluster node remove ${node} || storlog "ERR" "Failed: pcs cluster node remove ${node}"
 
     if [[ ${DETERMINISTIC_FAILOVER} == true ]]; then
-        local cibfile=$(mktemp --tmpdir=$HA_CONF_secdir)
+        local cibfile=$(mktemp --tmpdir=${HA_CONF_secdir})
         pcs cluster cib ${cibfile}
 
         local ipcount=$(wc -w <<< "${HA_VIPS}")
@@ -645,7 +670,7 @@ refresh_nfs_config()
         local tganesha_vol_conf=$(mktemp)
 
         cp ${HA_NFS_EXPDIR}/export.$VOL.conf ${tganesha_vol_conf}
-        local get_id="cat $HA_NFS_EXPDIR/export.$VOL.conf | grep Export_Id | cut -d \" \" -f8"
+        local get_id="cat ${HA_NFS_EXPDIR}/export.$VOL.conf | grep Export_Id | cut -d \" \" -f8"
 
         if [ -e ${SECRET_PEM} ]; then
         while [[ ${1} ]]; do
@@ -668,7 +693,7 @@ org.ganesha.nfsd.exportmgr.RemoveExport uint16:$_id 2>&1")
 
             _out=$(sshdo ${current_host} "dbus-send  --system \
 --dest=org.ganesha.nfsd  /org/ganesha/nfsd/ExportMgr \
-org.ganesha.nfsd.exportmgr.AddExport string:$HA_NFS_EXPDIR/export.$VOL.conf \
+org.ganesha.nfsd.exportmgr.AddExport string:${HA_NFS_EXPDIR}/export.$VOL.conf \
 string:\"EXPORT(Path=/$VOL)\"")
             _ret=$?
             storlog "DEBUG" "${_out}"
@@ -696,38 +721,42 @@ elif [[ ${cmd} == *status ]]; then
 fi
 
 HA_CONF_secdir=$(mktemp -d --tmpdir "$(basename $0).XXXXXXXXXX")
-HA_CONF_sec="$HA_CONF_secdir/sec.conf"
+HA_CONF_sec="${HA_CONF_secdir}/sec.conf"
 
 # Filter all config files into secure format
-egrep '^#|^[^ ]*=[^;&]*'  "$HA_CONF" > "$HA_CONF_sec"
-for conffile in `ls $HA_CONF_INCDIR/*.conf 2>/dev/null`; do
-    egrep '^#|^[^ ]*=[^;&]*'  "$conffile" >> "$HA_CONF_sec"
+egrep '^#|^[^ ]*=[^;&]*'  "${HA_CONF}" > "${HA_CONF_sec}"
+for conffile in `ls ${HA_CONF_INCDIR}/*.conf 2>/dev/null`; do
+    egrep '^#|^[^ ]*=[^;&]*'  "$conffile" >> "${HA_CONF_sec}"
 done
 
 # Source/load the config
-. $HA_CONF_sec
+. ${HA_CONF_sec}
 
 parsebool "DETERMINISTIC_FAILOVER"
 
-if [ -z "$HA_NFS_CONF" ]; then
-    # Try loading the NFS-Ganesha config from various distro-specific locations
-    if [ -f /etc/sysconfig/ganesha ]; then
-        GANSYSCONF="/etc/sysconfig/ganesha"
-    elif [ -f /etc/conf.d/ganesha ]; then
-        GANSYSCONF="/etc/conf.d/ganesha"
-    elif [ -f /etc/default/ganesha ]; then
-        GANSYSCONF="/etc/default/ganesha"
-    fi
+parse_services
 
-    if [ -z "$GANSYSCONF" ]; then
-        GANSYSOPTS=$(grep -s "OPTIONS" "$GANSYSCONF")
-        if [ -n "$GANSYSOPTS" ] && grep -qs "-f" < "${GANSYSOPTS}"; then
-            HA_NFS_CONF=$(sed -ne 's/^.*-f[= ]*([^\s]*)*/\1/p')
+if [[ "X${HA_SVC_NFS}X" == "XyesX" ]]; then
+    if [ -z "${HA_NFS_CONF}" ]; then
+        # Try loading the NFS-Ganesha config from various distro-specific locations
+        if [ -f /etc/sysconfig/ganesha ]; then
+            GANSYSCONF="/etc/sysconfig/ganesha"
+        elif [ -f /etc/conf.d/ganesha ]; then
+            GANSYSCONF="/etc/conf.d/ganesha"
+        elif [ -f /etc/default/ganesha ]; then
+            GANSYSCONF="/etc/default/ganesha"
+        fi
+
+        if [ -z "${GANSYSCONF}" ]; then
+            GANSYSOPTS=$(grep -s "OPTIONS" "${GANSYSCONF}")
+            if [ -n "${GANSYSOPTS}" ] && grep -qs "-f" < "${GANSYSOPTS}"; then
+                HA_NFS_CONF=$(sed -ne 's/^.*-f[= ]*([^\s]*)*/\1/p')
+            fi
         fi
     fi
+    HA_NFS_CONF="${HA_NFS_CONF:-/etc/ganesha/ganesha.conf}"
+    HA_NFS_EXPDIR="${HA_NFS_EXPDIR:-$(dirname ${HA_NFS_CONF})/exports}"
 fi
-HA_NFS_CONF="${HA_NFS_CONF:-/etc/ganesha/ganesha.conf}"
-HA_NFS_EXPDIR="${HA_NFS_EXPDIR:-$(dirname ${HA_NFS_CONF})/exports}"
 
 case "${cmd}" in
     setup | --setup)
@@ -775,4 +804,4 @@ case "${cmd}" in
         ;;
 esac
 
-rm -rf $HA_CONF_secdir
+rm -rf ${HA_CONF_secdir}
